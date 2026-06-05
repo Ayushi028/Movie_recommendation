@@ -159,7 +159,7 @@ def tfidf_recommend_titles(query_title: str, top_n: int = 10) -> List[Tuple[str,
             title_i = str(df.iloc[int(i)]["title"])
         except Exception:
             continue
-        # FIXED: removed extra )
+        # FIX: Only ONE ) at the end
         out.append((title_i, float(scores[int(i)]))
         if len(out) >= top_n:
             break
