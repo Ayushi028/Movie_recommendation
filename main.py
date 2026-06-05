@@ -10,16 +10,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+
 # =========================
-# ENV
+# ENV - Using OMDB
 # =========================
 load_dotenv()
-OMDB_API_KEY = os.getenv("TMDB_API_KEY")  # Using TMDB_API_KEY env var for OMDB
-
+OMDB_API_KEY = os.getenv("TMDB_API_KEY")  # Uses TMDB_API_KEY env var for OMDB
 OMDB_BASE = "http://www.omdbapi.com/"
 
 if not OMDB_API_KEY:
     raise RuntimeError("TMDB_API_KEY missing. Put it in .env as TMDB_API_KEY=xxxx")
+
 
 # =========================
 # FASTAPI APP
@@ -33,6 +34,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # =========================
 # PICKLE GLOBALS
@@ -50,6 +52,7 @@ tfidf_matrix: Any = None
 tfidf_obj: Any = None
 TITLE_TO_IDX: Optional[Dict[str, int]] = None
 
+
 # =========================
 # MODELS
 # =========================
@@ -60,6 +63,7 @@ class TMDBMovieCard(BaseModel):
     release_date: Optional[str] = None
     vote_average: Optional[float] = None
 
+
 class TMDBMovieDetails(BaseModel):
     tmdb_id: str
     title: str
@@ -69,10 +73,12 @@ class TMDBMovieDetails(BaseModel):
     backdrop_url: Optional[str] = None
     genres: List[dict] = []
 
+
 class TFIDFRecItem(BaseModel):
     title: str
     score: float
     tmdb: Optional[TMDBMovieCard] = None
+
 
 class SearchBundleResponse(BaseModel):
     query: str
@@ -80,28 +86,43 @@ class SearchBundleResponse(BaseModel):
     tfidf_recommendations: List[TFIDFRecItem]
     genre_recommendations: List[TMDBMovieCard]
 
+
 # =========================
 # UTILS
 # =========================
 def _norm_title(t: str) -> str:
     return str(t).strip().lower()
 
+
+# =========================
+# OMDB HELPERS
+# =========================
 async def omdb_get(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Safe OMDB GET"""
     q = dict(params)
     q["apikey"] = OMDB_API_KEY
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(OMDB_BASE, params=q)
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(OMDB_BASE, params=q)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"OMDB error: {e}")
+    
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"OMDB error {r.status_code}: {r.text}")
+    
     data = r.json()
     if data.get("Response") == "False":
         raise HTTPException(status_code=404, detail=f"OMDB: {data.get('Error', 'Not found')}")
     return data
 
+
 async def omdb_search_movies(query: str, page: int = 1) -> Dict[str, Any]:
+    """Search OMDB for movies"""
     return await omdb_get({"s": query, "type": "movie", "page": page})
 
+
 async def omdb_movie_details(imdb_id: str) -> TMDBMovieDetails:
+    """Get movie details from OMDB"""
     data = await omdb_get({"i": imdb_id, "plot": "full"})
     genre_list = [{"name": g.strip()} for g in data.get("Genre", "").split(",") if g.strip()]
     return TMDBMovieDetails(
@@ -114,29 +135,46 @@ async def omdb_movie_details(imdb_id: str) -> TMDBMovieDetails:
         genres=genre_list,
     )
 
-async def omdb_cards_from_search(data: Dict[str, Any], limit: int = 20) -> List[TMDBMovieCard]:
+
+async def omdb_cards_from_results(results: List[dict], limit: int = 20) -> List[TMDBMovieCard]:
+    """Convert OMDB results to cards"""
     out: List[TMDBMovieCard] = []
-    for m in data.get("Search", [])[:limit]:
+    for m in (results or [])[:limit]:
         out.append(TMDBMovieCard(
-            tmdb_id=m.get("imdbID", ""),
-            title=m.get("Title", ""),
+            tmdb_id=str(m.get("imdbID") or m.get("id")),
+            title=m.get("Title") or m.get("title") or "",
             poster_url=m.get("Poster") if m.get("Poster") != "N/A" else None,
-            release_date=m.get("Year", ""),
+            release_date=m.get("Year") or "",
         ))
     return out
 
+
 async def omdb_search_first(query: str) -> Optional[dict]:
+    """Get first search result"""
     data = await omdb_search_movies(query=query, page=1)
     results = data.get("Search", [])
     return results[0] if results else None
 
+
+# =========================
+# TF-IDF Helpers
+# =========================
 def build_title_to_idx_map(indices: Any) -> Dict[str, int]:
     title_to_idx: Dict[str, int] = {}
-    for k, v in indices.items():
-        title_to_idx[_norm_title(k)] = int(v)
-    return title_to_idx
+    if isinstance(indices, dict):
+        for k, v in indices.items():
+            title_to_idx[_norm_title(k)] = int(v)
+        return title_to_idx
+    try:
+        for k, v in indices.items():
+            title_to_idx[_norm_title(k)] = int(v)
+        return title_to_idx
+    except Exception:
+        raise RuntimeError("indices.pkl must be dict or pandas Series-like")
+
 
 def get_local_idx_by_title(title: str) -> int:
+    global TITLE_TO_IDX
     if TITLE_TO_IDX is None:
         raise HTTPException(status_code=500, detail="TF-IDF index map not initialized")
     key = _norm_title(title)
@@ -144,13 +182,18 @@ def get_local_idx_by_title(title: str) -> int:
         return int(TITLE_TO_IDX[key])
     raise HTTPException(status_code=404, detail=f"Title not found: '{title}'")
 
+
 def tfidf_recommend_titles(query_title: str, top_n: int = 10) -> List[Tuple[str, float]]:
+    """Return similar titles from local TF-IDF"""
+    global df, tfidf_matrix
     if df is None or tfidf_matrix is None:
         raise HTTPException(status_code=500, detail="TF-IDF resources not loaded")
+    
     idx = get_local_idx_by_title(query_title)
     qv = tfidf_matrix[idx]
     scores = (tfidf_matrix @ qv.T).toarray().ravel()
     order = np.argsort(-scores)
+    
     out: List[Tuple[str, float]] = []
     for i in order:
         if int(i) == int(idx):
@@ -159,14 +202,14 @@ def tfidf_recommend_titles(query_title: str, top_n: int = 10) -> List[Tuple[str,
             title_i = str(df.iloc[int(i)]["title"])
         except Exception:
             continue
-        # FIX: Only ONE ) at the end
-       out.append((title_i, float(scores[int(i)])))
-
+        out.append((title_i, float(scores[int(i)]))
         if len(out) >= top_n:
             break
     return out
 
-async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
+
+async def attach_card_by_title(title: str) -> Optional[TMDBMovieCard]:
+    """Get movie card by title"""
     m = await omdb_search_first(title)
     if not m:
         return None
@@ -177,12 +220,14 @@ async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
         release_date=m.get("Year", ""),
     )
 
+
 # =========================
 # STARTUP
 # =========================
 @app.on_event("startup")
 def load_pickles():
     global df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX
+    
     with open(DF_PATH, "rb") as f:
         df = pickle.load(f)
     with open(INDICES_PATH, "rb") as f:
@@ -191,7 +236,9 @@ def load_pickles():
         tfidf_matrix = pickle.load(f)
     with open(TFIDF_PATH, "rb") as f:
         tfidf_obj = pickle.load(f)
+    
     TITLE_TO_IDX = build_title_to_idx_map(indices_obj)
+
 
 # =========================
 # ROUTES
@@ -200,9 +247,10 @@ def load_pickles():
 def health():
     return {"status": "ok"}
 
+
 @app.get("/home", response_model=List[TMDBMovieCard])
 async def home(category: str = Query("popular"), limit: int = Query(24, ge=1, le=50)):
-    # Hardcoded popular movies with REAL posters
+    """Home feed with hardcoded popular movies"""
     popular_movies = [
         {"imdbID": "tt0111161", "Title": "The Shawshank Redemption", "Poster": "https://m.media-amazon.com/images/M/MV5BNDE3ODcxYzMtY2YzZC00NmNlLWJiNDMtZDViZWM2MzIxNDYwXkEyXkFqcGdeQXVyNjAwNDUxODI@._V1_.jpg", "Year": "1994"},
         {"imdbID": "tt0068646", "Title": "The Godfather", "Poster": "https://m.media-amazon.com/images/M/MV5BM2MyNjYxNmUtYTAwNi00MTYxLWJmNWYtYzZlOGI2ZjMyNDVmXkEyXkFqcGdeQXVyNzkwMjQ5NzM@._V1_.jpg", "Year": "1972"},
@@ -215,30 +263,39 @@ async def home(category: str = Query("popular"), limit: int = Query(24, ge=1, le
     ]
     return [TMDBMovieCard(tmdb_id=m["imdbID"], title=m["Title"], poster_url=m["Poster"], release_date=m["Year"]) for m in popular_movies[:limit]]
 
+
 @app.get("/tmdb/search")
 async def tmdb_search(query: str = Query(..., min_length=1), page: int = Query(1, ge=1, le=10)):
+    """Search movies"""
     data = await omdb_search_movies(query=query, page=page)
     return {"results": data.get("Search", [])}
 
+
 @app.get("/movie/id/{imdb_id}", response_model=TMDBMovieDetails)
 async def movie_details_route(imdb_id: str):
+    """Get movie details"""
     return await omdb_movie_details(imdb_id)
+
 
 @app.get("/recommend/genre", response_model=List[TMDBMovieCard])
 async def recommend_genre(tmdb_id: str = Query(...), limit: int = Query(18, ge=1, le=50)):
+    """Genre recommendations"""
     details = await omdb_movie_details(tmdb_id)
     if not details.genres:
         return []
     genre_name = details.genres[0]["name"]
     search_query = f"{details.title} {genre_name}"
     data = await omdb_search_movies(search_query, page=1)
-    cards = await omdb_cards_from_search(data, limit=limit)
+    cards = await omdb_cards_from_results(data.get("Search", []), limit=limit)
     return [c for c in cards if c.tmdb_id != tmdb_id]
+
 
 @app.get("/recommend/tfidf")
 async def recommend_tfidf(title: str = Query(..., min_length=1), top_n: int = Query(10, ge=1, le=50)):
+    """TF-IDF recommendations"""
     recs = tfidf_recommend_titles(title, top_n=top_n)
     return [{"title": t, "score": s} for t, s in recs]
+
 
 @app.get("/movie/search", response_model=SearchBundleResponse)
 async def search_bundle(
@@ -246,6 +303,7 @@ async def search_bundle(
     tfidf_top_n: int = Query(12, ge=1, le=30),
     genre_limit: int = Query(12, ge=1, le=30),
 ):
+    """Bundle: details + recommendations"""
     best = await omdb_search_first(query)
     if not best:
         raise HTTPException(status_code=404, detail=f"No movie found: {query}")
@@ -261,7 +319,7 @@ async def search_bundle(
         recs = []
     
     for title, score in recs:
-        card = await attach_tmdb_card_by_title(title)
+        card = await attach_card_by_title(title)
         tfidf_items.append(TFIDFRecItem(title=title, score=score, tmdb=card))
     
     # Genre recommendations
@@ -270,7 +328,7 @@ async def search_bundle(
         genre_name = details.genres[0]["name"]
         search_query = f"{details.title} {genre_name}"
         data = await omdb_search_movies(search_query, page=1)
-        cards = await omdb_cards_from_search(data, limit=genre_limit)
+        cards = await omdb_cards_from_results(data.get("Search", []), limit=genre_limit)
         genre_recs = [c for c in cards if c.tmdb_id != imdb_id]
     
     return SearchBundleResponse(
