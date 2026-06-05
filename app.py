@@ -37,11 +37,9 @@ qp_id = st.query_params.get("id")
 if qp_view in ("home", "details"):
     st.session_state.view = qp_view
 if qp_id:
-    try:
-        st.session_state.selected_tmdb_id = int(qp_id)
-        st.session_state.view = "details"
-    except:
-        pass
+    # FIXED: Keep as string (IMDB ID like "tt0111161")
+    st.session_state.selected_tmdb_id = str(qp_id)
+    st.session_state.view = "details"
 
 
 def goto_home():
@@ -52,11 +50,12 @@ def goto_home():
     st.rerun()
 
 
-def goto_details(tmdb_id: int):
+def goto_details(tmdb_id):
     st.session_state.view = "details"
-    st.session_state.selected_tmdb_id = int(tmdb_id)
+    # FIXED: Keep as string, don't convert to int
+    st.session_state.selected_tmdb_id = str(tmdb_id)
     st.query_params["view"] = "details"
-    st.query_params["id"] = str(int(tmdb_id))
+    st.query_params["id"] = str(tmdb_id)
     st.rerun()
 
 
@@ -124,10 +123,7 @@ def to_cards_from_tfidf_items(tfidf_items):
 
 
 # =============================
-# IMPORTANT: Robust TMDB search parsing
-# Supports BOTH API shapes:
-# 1) raw TMDB: {"results":[{id,title,poster_path,...}]}
-# 2) list cards: [{tmdb_id,title,poster_url,...}]
+# FIXED: OMDB search parsing (uses IMDb ID strings like "tt0111161")
 # =============================
 def parse_tmdb_search_to_cards(data, keyword: str, limit: int = 24):
     """
@@ -142,17 +138,18 @@ def parse_tmdb_search_to_cards(data, keyword: str, limit: int = 24):
         raw = data.get("results") or []
         raw_items = []
         for m in raw:
-            title = (m.get("title") or "").strip()
-            tmdb_id = m.get("id")
-            poster_path = m.get("poster_path")
+            title = (m.get("title") or m.get("Title") or "").strip()
+            # FIXED: Keep as string (IMDB ID)
+            tmdb_id = m.get("imdbID") or m.get("id")
+            poster_path = m.get("poster_path") or m.get("Poster")
             if not title or not tmdb_id:
                 continue
             raw_items.append(
                 {
-                    "tmdb_id": int(tmdb_id),
+                    "tmdb_id": str(tmdb_id),  # Keep as string
                     "title": title,
-                    "poster_url": f"{TMDB_IMG}{poster_path}" if poster_path else None,
-                    "release_date": m.get("release_date", ""),
+                    "poster_url": poster_path if poster_path and poster_path != "N/A" else None,
+                    "release_date": m.get("release_date") or m.get("Year") or "",
                 }
             )
 
@@ -160,18 +157,17 @@ def parse_tmdb_search_to_cards(data, keyword: str, limit: int = 24):
     elif isinstance(data, list):
         raw_items = []
         for m in data:
-            # might be {tmdb_id,title,poster_url}
-            tmdb_id = m.get("tmdb_id") or m.get("id")
+            tmdb_id = m.get("tmdb_id") or m.get("imdbID") or m.get("id")
             title = (m.get("title") or "").strip()
             poster_url = m.get("poster_url")
             if not title or not tmdb_id:
                 continue
             raw_items.append(
                 {
-                    "tmdb_id": int(tmdb_id),
+                    "tmdb_id": str(tmdb_id),  # Keep as string
                     "title": title,
                     "poster_url": poster_url,
-                    "release_date": m.get("release_date", ""),
+                    "release_date": m.get("release_date") or "",
                 }
             )
     else:
